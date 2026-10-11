@@ -883,7 +883,15 @@ const SQL = function SQL(
       if (BEFORE_COMMIT_OR_ROLLBACK_COMMAND) {
         await run_internal_transaction_sql(BEFORE_COMMIT_OR_ROLLBACK_COMMAND);
       }
-      const commit_result = await run_internal_transaction_sql(COMMIT_COMMAND);
+      let commit_result;
+      try {
+        commit_result = await run_internal_transaction_sql(COMMIT_COMMAND);
+      } catch (err) {
+        // PostgreSQL and MySQL end the transaction when COMMIT fails. SQLite keeps it open for
+        // SQLITE_BUSY or a deferred foreign key, so its adapter asks the database.
+        needs_rollback = pool.isConnectionInTransaction?.(pooledConnection) === true;
+        throw err;
+      }
       // PostgreSQL answers COMMIT on an aborted transaction with a
       // CommandComplete tag of "ROLLBACK" (the session is already in the
       // failed-transaction state, so nothing was committed). Surfacing that

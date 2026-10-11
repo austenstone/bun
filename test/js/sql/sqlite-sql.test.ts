@@ -1254,6 +1254,82 @@ describe("Transactions", () => {
     const accounts = await sql`SELECT * FROM accounts WHERE id = 1`;
     expect(accounts[0].balance).toBe(1002);
   });
+
+  // SQLite keeps the transaction open when COMMIT fails for a deferred foreign key or with SQLITE_BUSY.
+  test("a failed COMMIT is rolled back: deferred foreign key", async () => {
+    await sql`PRAGMA foreign_keys = ON`;
+    await sql`CREATE TABLE parent (id INTEGER PRIMARY KEY)`;
+    await sql`CREATE TABLE child (parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)`;
+
+    const failed = await sql
+      .begin(async tx => {
+        await tx`INSERT INTO child VALUES (99)`;
+      })
+      .then(
+        () => "committed",
+        e => e.code,
+      );
+    const next = await sql
+      .begin(async tx => {
+        await tx`INSERT INTO parent VALUES (1)`;
+        await tx`INSERT INTO child VALUES (1)`;
+      })
+      .then(
+        () => "committed",
+        e => e.message,
+      );
+
+    expect({ failed, next, children: await sql`SELECT parent_id FROM child` }).toEqual({
+      failed: "SQLITE_CONSTRAINT_FOREIGNKEY",
+      next: "committed",
+      children: [{ parent_id: 1 }],
+    });
+  });
+
+  test("a failed COMMIT is rolled back: SQLITE_BUSY", async () => {
+    using dir = tempDir("sqlite-commit-busy", {});
+    const dbPath = path.join(String(dir), "busy.db");
+    await using writer = new SQL({ adapter: "sqlite", filename: dbPath });
+    await writer`CREATE TABLE t (v TEXT)`;
+    await writer`INSERT INTO t VALUES ('seed')`;
+
+    let failed: string;
+    {
+      // The read lock of a second connection makes the COMMIT of the writer fail.
+      using reader = new Database(dbPath);
+      reader.run("BEGIN DEFERRED");
+      reader.query("SELECT count(*) FROM t").get();
+      failed = await writer
+        .begin(async tx => {
+          await tx`INSERT INTO t VALUES ('in the failed transaction')`;
+        })
+        .then(
+          () => "committed",
+          e => e.code,
+        );
+      reader.run("ROLLBACK");
+    }
+
+    await writer`INSERT INTO t VALUES ('later')`;
+    const next = await writer
+      .begin(async tx => {
+        await tx`INSERT INTO t VALUES ('in the next transaction')`;
+      })
+      .then(
+        () => "committed",
+        e => e.message,
+      );
+    await writer.close();
+
+    // A write that is still inside an open transaction does not reach the file.
+    using file = new Database(dbPath, { readonly: true });
+    const onDisk = file.query<{ v: string }, []>("SELECT v FROM t ORDER BY rowid").all();
+    expect({ failed, next, onDisk: onDisk.map(row => row.v) }).toEqual({
+      failed: "SQLITE_BUSY",
+      next: "committed",
+      onDisk: ["seed", "later", "in the next transaction"],
+    });
+  });
 });
 
 describe("SQLite-specific features", () => {
