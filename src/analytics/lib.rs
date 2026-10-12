@@ -569,3 +569,5 @@ pub mod generate_header {
 }
 
 pub use generate_header as GenerateHeader;
+
+// fork-only CI probe; not for upstream
