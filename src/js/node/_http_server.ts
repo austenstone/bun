@@ -2468,6 +2468,8 @@ function moveRawHeadToStore(res) {
   const facts = rawHead.charCodeAt(0);
   if (facts & RAW_HEAD_CONTENT_LENGTH) res._contentLength = null;
   if (facts & RAW_HEAD_TRANSFER_ENCODING) res.chunkedEncoding = false;
+  // writeHead() saw an empty header store and froze the framing as chunked. Lines that frame the body are in the store now.
+  if (facts & (RAW_HEAD_CONTENT_LENGTH | RAW_HEAD_TRANSFER_ENCODING)) res[kFramingFrozenChunked] = false;
   // A name has no colon, and a value has no line break.
   const lines = rawHead.slice(1).split("\r\n");
   for (let i = 0, length = lines.length - 1; i < length; i++) {
@@ -2582,36 +2584,34 @@ function renderNativeHeaders(res) {
   // nested render's bits into ours.
   let autoHeaders = 0;
   let keepAliveSecs = 0;
-  const headersMap = res[kOutHeaders];
-  // With the string of kRawHead there is no array: the string is the head.
-  let rawHead: string | undefined = res[kRawHead];
-  let flat!: string[];
-  if (rawHead === undefined) {
-    if (scratchFlatHeadersBusy) {
-      flat = [];
-    } else {
-      scratchFlatHeadersBusy = true;
-      scratchFlatHeaders.length = 0;
-      flat = scratchFlatHeaders;
-    }
-  }
+  let headersMap = res[kOutHeaders];
   let hasDate = false;
   let hasConnection = false;
   let hasKeepAlive = false;
   // Defined when the head names a Transfer-Encoding, a Content-Length.
   let headTransferEncoding;
   let headContentLength;
+  let rawHead: string | undefined = res[kRawHead];
+  let flat!: string[];
+  if (rawHead !== undefined) {
+    // The string of kRawHead is the head, whatever the store holds by now, and no array is made.
+    headersMap = null;
+    const facts = rawHead.charCodeAt(0);
+    hasDate = (facts & RAW_HEAD_DATE) !== 0;
+    hasConnection = (facts & (RAW_HEAD_CLOSE | RAW_HEAD_PERSIST)) !== 0;
+    hasKeepAlive = (facts & RAW_HEAD_KEEP_ALIVE) !== 0;
+    if (facts & RAW_HEAD_TRANSFER_ENCODING) headTransferEncoding = true;
+    if (facts & RAW_HEAD_CONTENT_LENGTH) headContentLength = true;
+    if (facts & RAW_HEAD_CLOSE) res[kMustCloseConnection] = true;
+  } else if (scratchFlatHeadersBusy) {
+    flat = [];
+  } else {
+    scratchFlatHeadersBusy = true;
+    scratchFlatHeaders.length = 0;
+    flat = scratchFlatHeaders;
+  }
   try {
-    if (rawHead !== undefined) {
-      // The lines that writeHead() took from its argument are the head, whatever the store holds by now.
-      const facts = rawHead.charCodeAt(0);
-      hasDate = (facts & RAW_HEAD_DATE) !== 0;
-      hasConnection = (facts & (RAW_HEAD_CLOSE | RAW_HEAD_PERSIST)) !== 0;
-      hasKeepAlive = (facts & RAW_HEAD_KEEP_ALIVE) !== 0;
-      if (facts & RAW_HEAD_TRANSFER_ENCODING) headTransferEncoding = true;
-      if (facts & RAW_HEAD_CONTENT_LENGTH) headContentLength = true;
-      if (facts & RAW_HEAD_CLOSE) res[kMustCloseConnection] = true;
-    } else if (headersMap !== null && headersMap !== undefined) {
+    if (headersMap !== null && headersMap !== undefined) {
       for (const key in headersMap) {
         const entry = headersMap[key];
         const name = entry[0];
@@ -4156,13 +4156,7 @@ ServerResponse.prototype.writeHead = function (statusCode, statusMessage, header
   // Node's writeHead() freezes body framing: _storeHeader runs with _contentLength null and
   // a later end(chunk) cannot add Content-Length once _header exists. Headers render lazily
   // here, so record the frozen choice for renderNativeHeaders.
-  const rawHead = this[kRawHead];
-  if (
-    !this[kImplicitHeaderFromEnd] &&
-    (rawHead !== undefined
-      ? !(rawHead.charCodeAt(0) & (RAW_HEAD_CONTENT_LENGTH | RAW_HEAD_TRANSFER_ENCODING))
-      : !this.hasHeader("content-length") && !this.hasHeader("transfer-encoding"))
-  ) {
+  if (!this[kImplicitHeaderFromEnd] && !this.hasHeader("content-length") && !this.hasHeader("transfer-encoding")) {
     this[kFramingFrozenChunked] = true;
   }
 

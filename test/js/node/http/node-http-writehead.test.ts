@@ -227,6 +227,11 @@ const stored = (res: http.ServerResponse) => ({
   get: res.getHeader("X-A"),
 });
 const nothingStored = { names: [], rawNames: [], headers: {}, has: false, get: undefined };
+const removed = (res: any) => ({
+  connection: res._removedConnection,
+  transferEncoding: res._removedTE,
+  contentLength: res._removedContLen,
+});
 
 describe("writeHead(status, headers) with no header set before sends the header lines as given", () => {
   for (const transport of transports) {
@@ -582,6 +587,22 @@ describe("writeHead(status, headers) with no header set before keeps the headers
       assert.deepStrictEqual(result, nothingStored);
     });
   }
+
+  // Node's matchHeader() clears the mark of removeHeader() for a header that it sees.
+  test("a header that the argument names is not a removed header any more", async () => {
+    const { result } = await respond(res => {
+      for (const name of ["Connection", "Transfer-Encoding", "Content-Length"]) res.removeHeader(name);
+      const before = { ...removed(res) };
+      res.writeHead(200, { "Connection": "keep-alive", "Transfer-Encoding": "chunked", "Content-Length": "2" });
+      const after = removed(res);
+      res.end("ok");
+      return { before, after };
+    });
+    assert.deepStrictEqual(result, {
+      before: { connection: true, transferEncoding: true, contentLength: true },
+      after: { connection: false, transferEncoding: false, contentLength: false },
+    });
+  });
 
   test("a header that a value's toString() sets is stored and not sent", async () => {
     const { headers, result } = await respond(res => {
@@ -1498,6 +1519,7 @@ describe("writeHead(status, headers) with no header set before keeps nothing whe
     ["an invalid character in an array value", ["X-A", "1", "X-B", ["ok", "a\nb"]], "ERR_INVALID_CHAR"],
     ["a value whose valueOf() throws", { "X-A": "1", "X-B": unprintable }, "RangeError"],
     ["a flat list with an odd count", ["X-A", "1", "X-B"], "ERR_INVALID_ARG_VALUE"],
+    ["a Proxy of a flat list with an odd count", new Proxy(["X-A", "1", "X-B"], {}), "ERR_INVALID_ARG_VALUE"],
     ["a name that is a Symbol in a flat list", ["X-A", "1", Symbol("s"), "1"], "ERR_INVALID_HTTP_TOKEN"],
     // eslint-disable-next-line no-sparse-arrays
     ["a name that is a hole in a flat list", ["X-A", "1", , "1"], "ERR_INVALID_HTTP_TOKEN"],

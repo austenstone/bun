@@ -856,19 +856,39 @@ struct RawHeadWalk {
 };
 
 // checkInvalidHeaderChar() of node:_http_common: https://github.com/nodejs/node/blob/v26.3.0/lib/_http_common.js#L214-L227
-template<typename CharacterType>
-static bool hasInvalidHeaderChar(std::span<const CharacterType> text, bool lenient)
+static bool isInvalidHeaderChar(char16_t c, bool lenient)
 {
-    for (char16_t c : text) {
-        if (c > 0xff || (lenient ? (c == 0x00 || c == 0x0a || c == 0x0d) : ((c < 0x20 && c != '\t') || c == 0x7f)))
-            return true;
-    }
-    return false;
+    return c > 0xff || (lenient ? (c == 0x00 || c == 0x0a || c == 0x0d) : ((c < 0x20 && c != '\t') || c == 0x7f));
 }
 
 static bool hasInvalidHeaderChar(const String& text, bool lenient)
 {
-    return text.is8Bit() ? hasInvalidHeaderChar(text.span8(), lenient) : hasInvalidHeaderChar(text.span16(), lenient);
+    if (!text.is8Bit()) {
+        for (char16_t c : text.span16()) {
+            if (isInvalidHeaderChar(c, lenient))
+                return true;
+        }
+        return false;
+    }
+    auto bytes = text.span8();
+    // Eight bytes at a time: both rules allow 0x20 to 0x7e, which is all of most values. Only a word with another byte is looked at byte by byte.
+    while (bytes.size() >= sizeof(uint64_t)) {
+        uint64_t word;
+        memcpy(&word, bytes.data(), sizeof(word));
+        constexpr uint64_t ones = 0x0101010101010101ULL;
+        if (((word - 0x20 * ones) | (word + ones) | word) & (0x80 * ones)) {
+            for (Latin1Character c : bytes.first(sizeof(word))) {
+                if (isInvalidHeaderChar(c, lenient))
+                    return true;
+            }
+        }
+        bytes = bytes.subspan(sizeof(word));
+    }
+    for (Latin1Character c : bytes) {
+        if (isInvalidHeaderChar(c, lenient))
+            return true;
+    }
+    return false;
 }
 
 // `list.length`, as the `i < list.length` of Node's loops reads it on each turn.
@@ -881,6 +901,16 @@ static double rawHeadListLength(JSGlobalObject* globalObject, JSObject* list)
     JSValue length = list->get(globalObject, vm.propertyNames->length);
     RETURN_IF_EXCEPTION(scope, 0);
     RELEASE_AND_RETURN(scope, length.toNumber(globalObject));
+}
+
+// `list[index]`. An entry that is in the storage of an array is read from there.
+static ALWAYS_INLINE JSValue rawHeadListEntry(JSGlobalObject* globalObject, JSObject* list, uint64_t index)
+{
+    if (index <= MAX_ARRAY_INDEX) [[likely]] {
+        if (JSValue entry = list->tryGetIndexQuickly(static_cast<unsigned>(index)))
+            return entry;
+    }
+    return list->get(globalObject, index);
 }
 
 // The line and matchHeader() of Node's storeHeader(): https://github.com/nodejs/node/blob/v26.3.0/lib/_http_outgoing.js#L608-L650
@@ -999,7 +1029,7 @@ static void appendRawHeader(RawHeadWalk& walk, String&& name, JSValue value)
             RETURN_IF_EXCEPTION(scope, void());
             if (!(static_cast<double>(i) < length))
                 return;
-            JSValue element = list->get(globalObject, i);
+            JSValue element = rawHeadListEntry(globalObject, list, i);
             RETURN_IF_EXCEPTION(scope, void());
             appendRawHeadValue(walk, name, element);
             RETURN_IF_EXCEPTION(scope, void());
@@ -1015,7 +1045,7 @@ static void appendRawHeader(RawHeadWalk& walk, String&& name, JSValue value)
     for (uint64_t i = 0; i < count; i++) {
         if (i)
             text.append("; "_s);
-        JSValue element = list->get(globalObject, i);
+        JSValue element = rawHeadListEntry(globalObject, list, i);
         RETURN_IF_EXCEPTION(scope, void());
         if (element.isUndefinedOrNull())
             continue;
@@ -1083,12 +1113,12 @@ static void walkRawHead(RawHeadWalk& walk, JSValue headers)
         RETURN_IF_EXCEPTION(scope, void());
         bool isPairs = false;
         if (length) {
-            JSValue first = list->get(globalObject, 0u);
+            JSValue first = rawHeadListEntry(globalObject, list, 0);
             RETURN_IF_EXCEPTION(scope, void());
             isPairs = JSC::isArray(globalObject, first);
             RETURN_IF_EXCEPTION(scope, void());
         }
-        if (!isPairs && std::fmod(length, 2) != 0) {
+        if (!isPairs && (isJSArray(list) ? static_cast<uint64_t>(length) & 1 : std::fmod(length, 2) != 0)) {
             Bun::ERR::INVALID_ARG_VALUE(scope, globalObject, "headers"_s, headers);
             return;
         }
@@ -1097,16 +1127,16 @@ static void walkRawHead(RawHeadWalk& walk, JSValue headers)
             RETURN_IF_EXCEPTION(scope, void());
             if (!(static_cast<double>(i) < length))
                 return;
-            JSValue name = list->get(globalObject, i);
+            JSValue name = rawHeadListEntry(globalObject, list, i);
             RETURN_IF_EXCEPTION(scope, void());
             JSValue value;
             if (isPairs) {
                 JSValue pair = name;
-                name = pair.get(globalObject, 0u);
+                name = pair.isObject() ? rawHeadListEntry(globalObject, asObject(pair), 0) : pair.get(globalObject, 0u);
                 RETURN_IF_EXCEPTION(scope, void());
-                value = pair.get(globalObject, 1u);
+                value = pair.isObject() ? rawHeadListEntry(globalObject, asObject(pair), 1) : pair.get(globalObject, 1u);
             } else {
-                value = list->get(globalObject, i + 1);
+                value = rawHeadListEntry(globalObject, list, i + 1);
             }
             RETURN_IF_EXCEPTION(scope, void());
             appendRawHeader(walk, name, value);
